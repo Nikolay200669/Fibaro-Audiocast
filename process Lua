@@ -1,0 +1,279 @@
+local mac		= "02:22:6c:07:83:14";
+--local mac		= "02:22:6c:07:83:14";
+
+-------------------------------------
+local selfId = fibaro:getSelfId();
+local ip = fibaro:get(selfId, 'IPAddress');
+local port = fibaro:get(selfId, 'TCPPort');
+local command = fibaro:getGlobal('dlnaCommand');
+local value = fibaro:getGlobal('dlnaValue');
+
+local action = "";
+local sa = "";
+local service = "";
+
+
+-- Allows to split string to array by endline ----
+function lines(str)
+  local t = {}
+  local function helper(line) table.insert(t, line) return "" end
+  helper((str:gsub("(.-)\r?\n", helper)))
+  return t
+end
+
+function split(s, delimiter)
+    result = {};
+    for match in (s..delimiter):gmatch("(.-)"..delimiter) do
+        table.insert(result, match);
+    end
+    return result;
+end
+
+-- html unescape
+function unescape(str)
+  str = string.gsub( str, '&lt;', '<' )
+  str = string.gsub( str, '&gt;', '>' )
+  str = string.gsub( str, '&quot;', '"' )
+  str = string.gsub( str, '&apos;', "'" )
+  str = string.gsub( str, '&#(%d+);', function(n) return string.char(n) end )
+  str = string.gsub( str, '&#x(%d+);', function(n) return string.char(tonumber(n,16)) end )
+  str = string.gsub( str, '&amp;', '&' ) -- Be sure to do this after all others
+  return str
+end
+
+-- This function allows to get control port
+-- by IP address. DLNA discovery was used
+function getPort(ip)
+  	fibaro:debug("Start discovery for: " .. ip);
+	local device = "urn:schemas-upnp-org:device:MediaRenderer:1";
+	local s	= "";
+	s = s .. "M-SEARCH * HTTP/1.1" .. "\r\n";
+	s = s .. "HOST: 239.255.255.250:1900\r\n";
+	s = s .. 'MAN: "ssdp:discover"' .. "\r\n";
+	s = s .. "ST:" .. device .. "\r\n";
+	s = s .. "CACHE-CONTROL: no-cache" .. "\r\n";
+	s = s .. 'MX: 1' .. "\r\n\r\n";
+	
+	socket = Net.FUdpSocket() 
+	socket:setBroadcast(true) 
+	socket:setReadTimeout(3000);
+	bytes, errorCode = socket:write(s, "239.255.255.250", 1900) 
+	
+	fibaro:debug("Discovery recieved");
+  
+	out = "";
+	while 1 do
+	  	state = socket:read();
+	  	if(string.len(state) == 0) then
+		    break;
+	  	else
+		    out = out .. state;
+  		end
+	end
+	
+	tabl = lines(out);
+  
+	for i,v in pairs(tabl) do
+	  	v = string.lower(v);
+	  	local k = string.find(v, "location:");
+	  	if(k ~= nil) then
+		    local ip_port = v:match('//(.-)/');
+
+      		fibaro:debug(ip_port);
+		  
+			local arr = split(ip_port, ":");
+      
+      		--fibaro:debug(arr[1] .. " " .. arr[2]);
+
+      		if(arr[1] == ip) then
+        		fibaro:debug("Found discovery " .. arr[1] .. ":" .. arr[2]);
+        		return arr[2];
+        	end
+  		end
+	end
+end
+
+
+-- This function allows to convert string to HEX
+function string.tohex(str)
+    return (str:gsub('.', function (c)
+        return string.format('%02X', string.byte(c))
+    end))
+end
+
+function sendDLNA(action, service, sa, ip, port)
+	local m = "";
+	m = m .. '<?xml version="1.0" encoding="utf-8"?>\n';
+	m = m .. '<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">\n';
+	m = m .. '<s:Body>' .. action .. '</s:Body>\n';
+	m = m .. '</s:Envelope>\n';
+	
+	local s = "";
+	s = s .. 'POST ' .. service .. ' HTTP/1.1\n';
+	s = s .. 'HOST: ' .. ip .. ':' .. port .. '\n';
+	s = s .. 'SOAPACTION: "' .. sa .. '"\n';
+	s = s .. 'CONTENT-TYPE: text/xml; charset="utf-8"\n';
+	s = s .. 'Content-Length: ' .. string.len(m) .. '\n\n';
+	
+  	fibaro:debug("Send DLNA command: "  .. ip .. " " .. port);
+  
+	tcpSocket = Net.FTcpSocket(ip, port);
+  	--tcpSocket:setReadTimeout(3000);
+  	bytes, errorCode = tcpSocket:write(s .. m);
+  	fibaro:debug("DLNA written");
+
+  	out = "";
+  	
+  	while 1 do
+	   	state = tcpSocket:read();
+
+    	if(string.len(state) == 0) then
+      		break;
+      	else
+    		out = out .. state;
+      	end
+    end
+ 
+	if(errorCode == 0) 
+	then 
+	   	fibaro:debug("Response LEN: " .. string.len(out));
+  		fibaro:debug("DLNA transfer OK");
+	  	fibaro:call(selfId, "setProperty", "ui.statusLabel.value", "online");
+		return out;
+	else 
+  		fibaro:debug("DLNA transfer failed");
+	  	fibaro:call(selfId, "setProperty", "ui.statusLabel.value", "offline");
+    	
+    	for i=1,5 do
+    		if(updateIP()) then
+        		fibaro:debug('IP found again!!!');
+				fibaro:call(fibaro:getSelfId(), "pressButton", "13")
+        		return -1;
+        	end;
+      	end
+	end
+  	return -1;
+end
+
+-- This function allows to find IP by MAC
+function updateIP()
+  	fibaro:debug('Try to update IP');
+	local HC2 = Net.FHttp("127.0.0.1", 11111)
+	local response, status, errorCode = HC2.POST(HC2, "/api/networkDiscovery/arp", "{}");
+	
+	jsonTable = json.decode(response);
+  	fibaro:debug('ARP provided');
+	
+	for i, name in ipairs(jsonTable) do
+    	fibaro:debug(name['ip'] .. " " ..name['mac']);
+    
+    	if(name['mac'] == mac) then
+      		fibaro:debug('Found mac from list');
+      
+      		local port = getPort(name['ip']);
+			
+      		if(port ~= nil) then
+	        	fibaro:debug("MAC found: " .. mac);
+	        	fibaro:debug("IP found: " .. name['ip']);
+	      		fibaro:debug("port found: " .. port);
+	      
+	     		local response, status, errorCode = HC2.GET(HC2, "/api/virtualDevices/" .. fibaro:getSelfId() );
+				jsonTable = json.decode(response) 
+				jsonTable.properties.ip = name['ip'];
+	      		fibaro:debug("Save ip and port to JSON: " .. name['ip'] .. ":" .. port);
+			    jsonTable.properties.port = tonumber(port);
+				json = json.encode(jsonTable); 
+				HC2:PUT("/api/virtualDevices/" .. fibaro:getSelfId(), json);
+	      		return true;
+        	end
+      end
+	end
+	return false;
+end
+
+fibaro:debug('Start command: ' .. command);
+if(command == "PLAY") then
+	action = '<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><Speed>1</Speed></u:Play>';
+	sa = 'urn:schemas-upnp-org:service:AVTransport:1#Play'  
+  	service = '/upnp/control/rendertransport1';
+elseif(command == "PAUSE") then
+	action = '<u:Pause xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Pause>';
+	sa = 'urn:schemas-upnp-org:service:AVTransport:1#Pause'  
+  	service = '/upnp/control/rendertransport1';
+elseif(command == 'NEXT') then
+	action = '<u:Next xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Next>';
+	sa = 'urn:schemas-upnp-org:service:AVTransport:1#Next'  
+  	service = '/upnp/control/rendertransport1';
+elseif(command == 'PREV') then
+  	action = '<u:Previous xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Previous>';
+	sa = 'urn:schemas-upnp-org:service:AVTransport:1#Previous'  
+  	service = '/upnp/control/rendertransport1';
+elseif(command == "STOP") then
+	action = '<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Stop>';
+	sa = 'urn:schemas-upnp-org:service:AVTransport:1#Stop'  
+  	service = '/upnp/control/rendertransport1';
+elseif(command == "VOLUME") then
+  	local volume = fibaro:getValue(selfId, "ui.volume.value");
+  	fibaro:debug('new volume: ' .. volume);
+	action	= '<u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"><InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>' .. volume ..'</DesiredVolume></u:SetVolume>';
+	sa		= 'urn:schemas-upnp-org:service:RenderingControl:1#SetVolume';
+  	service = '/upnp/control/rendercontrol1';
+elseif(command == "URL") then
+	--value	= "http://translate.google.com/translate_tts?ie=UTF-8&q=%D0%9F%D0%BE%D1%81%D1%82%D0%BE%D0%B9%20%D0%BF%D0%B0%D1%80%D0%BE%D0%B2%D0%BE%D0%B7%20%D0%BD%D0%B5%20%D1%81%D1%82%D1%83%D1%87%D0%B8%D1%82%D0%B5%20%D0%BA%D0%BE%D0%BB%D0%B5%D1%81%D0%B0!&tl=ru&total=1&idx=0&textlen=33&tk=383852.259659&client=t&prev=input";
+  	fibaro:debug("Plan url: " .. value);
+  	action	= '<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><CurrentURI>' .. value .. '</CurrentURI><CurrentURIMetaData ></CurrentURIMetaData></u:SetAVTransportURI>';
+	sa		= 'urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI';
+  	service = '/upnp/control/rendertransport1';
+elseif(command == "SD") then
+  	action	= '<u:PlayQueueWithIndex xmlns:u="urn:schemas-wiimu-com:service:PlayQueue:1"><QueueName>USBDiskQueue</QueueName><Index>2</Index></u:PlayQueueWithIndex>';
+	sa		= 'urn:schemas-wiimu-com:service:PlayQueue:1#PlayQueueWithIndex';
+  	service = '/upnp/control/PlayQueue1';
+elseif(command == "SYNC") then
+  	fibaro:debug('Stand syncing');
+  	local connection = Net.FHttp(ip, 80);
+  	local response, status, errorCode = connection.GET(connection, "/httpapi.asp?command=getStatusEx");
+	local json = json.decode(response);
+  	ssid = json.ssid:tohex();
+	
+  	fibaro:debug('ssid found: ' .. ssid);
+  
+	local connection = Net.FHttp("192.168.0.104", 80);
+	local response, status, errorCode = connection.GET(connection, "/httpapi.asp?command=ConnectMasterAp:ssid=" .. ssid .. ":ch=5:auth=OPEN:encry=NONE:pwd=null:chext=1");
+  	fibaro:debug("/httpapi.asp?command=ConnectMasterAp:ssid=" .. ssid .. ":ch=5:auth=OPEN:encry=NONE:pwd=null:chext=1");
+  
+elseif(command == "UNSYNC") then
+  	local connection = Net.FHttp(ip, 80);
+	
+  	-- get all slaves
+  	local response, status, errorCode = connection.GET(connection, "/httpapi.asp?command=multiroom:getSlaveList");
+	jsonTable = json.decode(response);
+	
+	for k, v in pairs(jsonTable.slave_list) do  
+    	fibaro:debug("Remove slave with ip: " .. v.ip);
+    	local response, status, errorCode = connection.GET(connection, "/httpapi.asp?command=multiroom:SlaveKickout:" .. v.ip);
+    end
+elseif(command == "TITLE") then  
+  	action	= '<u:GetInfoEx xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:GetInfoEx>';
+	sa		= 'urn:schemas-upnp-org:service:AVTransport:1#GetInfoEx';
+  	service = '/upnp/control/rendertransport1';
+  
+  	out		= sendDLNA(action, service, sa, ip, port);
+  	meta	= out:match('<TrackMetaData>(.-)</TrackMetaData>');
+  	uri		= out:match('<TrackURI>(.-)</TrackURI>');
+  	meta	= unescape(meta);
+  	creator	= meta:match('<dc:creator>(.-)</dc:creator>');
+  	title	= meta:match('<dc:title>(.-)</dc:title>');
+  	if(title ~= nil and creator ~= nil) then
+	  	fibaro:call(selfId, "setProperty", "ui.titleLabel.value", creator .. "-" .. title);
+    elseif(uri ~= nil) then
+    	fibaro:call(selfId, "setProperty", "ui.titleLabel.value", uri);
+    else
+    	fibaro:call(selfId, "setProperty", "ui.titleLabel.value", "");
+    end
+end
+
+fibaro:debug("command: " .. command);
+
+if(action ~= "") then
+	sendDLNA(action, service, sa, ip, port)
+end
